@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="theme-color" content="#0f172a"/>
+<meta name="description" content="Personal expense splitting app"/>
+<title>SplitEase — Expense Splitter</title>
+<link rel="manifest" id="manifest-placeholder"/>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Outfit','sans-serif']},colors:{brand:{50:'#f0fdf4',100:'#dcfce7',500:'#22c55e',600:'#16a34a'},dark:{900:'#0a0f1a',800:'#0f172a',700:'#1e293b'}}}}}
+</script>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+body{font-family:'Outfit',sans-serif;overscroll-behavior:none;}
+.safe-bottom{padding-bottom:env(safe-area-inset-bottom,0px);}
+.slide-up{animation:slideUp .3s cubic-bezier(.4,0,.2,1) both;}
+.fade-in{animation:fadeIn .25s ease both;}
+@keyframes slideUp{from{opacity:0;transform:translateY(24px);}to{opacity:1;transform:translateY(0);}}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+.card-hover{transition:transform .2s,box-shadow .2s;}
+.card-hover:active{transform:scale(.97);}
+input,select,textarea{font-family:'Outfit',sans-serif;}
+::-webkit-scrollbar{width:0;}
+.gradient-text{background:linear-gradient(135deg,#22c55e,#3b82f6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+</style>
+</head>
+<body class="bg-slate-900 text-white min-h-screen">
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useRef}=React;
+
+// ── IndexedDB ──
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const req=indexedDB.open('splitease_db',1);
+    req.onupgradeneeded=e=>{
+      const db=e.target.result;
+      if(!db.objectStoreNames.contains('groups'))db.createObjectStore('groups',{keyPath:'id'});
+      if(!db.objectStoreNames.contains('expenses')){const s=db.createObjectStore('expenses',{keyPath:'id'});s.createIndex('groupId','groupId',{unique:false});}
+      if(!db.objectStoreNames.contains('settlements')){const s=db.createObjectStore('settlements',{keyPath:'id'});s.createIndex('groupId','groupId',{unique:false});}
+    };
+    req.onsuccess=e=>resolve(e.target.result);
+    req.onerror=()=>reject(req.error);
+  });
+}
+async function dbGetAll(store){
+  const db=await openDB();
+  return new Promise((res,rej)=>{const req=db.transaction(store,'readonly').objectStore(store).getAll();req.onsuccess=()=>res(req.result);req.onerror=()=>rej(req.error);});
+}
+async function dbPut(store,obj){
+  const db=await openDB();
+  return new Promise((res,rej)=>{const req=db.transaction(store,'readwrite').objectStore(store).put(obj);req.onsuccess=()=>res(req.result);req.onerror=()=>rej(req.error);});
+}
+async function dbDelete(store,id){
+  const db=await openDB();
+  return new Promise((res,rej)=>{const req=db.transaction(store,'readwrite').objectStore(store).delete(id);req.onsuccess=()=>res();req.onerror=()=>rej(req.error);});
+}
+async function dbGetByIndex(store,idx,val){
+  const db=await openDB();
+  return new Promise((res,rej)=>{const req=db.transaction(store,'readonly').objectStore(store).index(idx).getAll(val);req.onsuccess=()=>res(req.result);req.onerror=()=>rej(req.error);});
+}
+
+// ── Balance Algorithm ──
+function calculateBalances(members,expenses,settlements){
+  const net={};
+  members.forEach(m=>net[m]=0);
+  expenses.forEach(exp=>{
+    const share=exp.amount/exp.members.length;
+    exp.members.forEach(m=>{if(!net[m])net[m]=0;net[m]-=share;});
+    if(!net[exp.paidBy])net[exp.paidBy]=0;
+    net[exp.paidBy]+=exp.amount;
+  });
+  settlements.forEach(s=>{
+    if(!net[s.from])net[s.from]=0;
+    if(!net[s.to])net[s.to]=0;
+    net[s.from]+=s.amount;net[s.to]-=s.amount;
+  });
+  const debts=[],pos=[],neg=[];
+  Object.entries(net).forEach(([m,b])=>{if(b>0.01)pos.push({m,b});else if(b<-0.01)neg.push({m,b:-b});});
+  let i=0,j=0;
+  while(i<pos.length&&j<neg.length){
+    const amt=Math.min(pos[i].b,neg[j].b);
+    debts.push({from:neg[j].m,to:pos[i].m,amount:Math.round(amt*100)/100});
+    pos[i].b-=amt;neg[j].b-=amt;
+    if(pos[i].b<0.01)i++;if(neg[j].b<0.01)j++;
+  }
+  return{net,debts};
+}
+
+// ── Helpers ──
+const COLORS=['#22c55e','#3b82f6','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
+function Avatar({name,size=36}){
+  const idx=name?name.charCodeAt(0)%COLORS.length:0;
+  return <div style={{width:size,height:size,background:COLORS[idx],fontSize:size*0.38,flexShrink:0}} className="flex items-center justify-center rounded-full font-bold text-white">{name?name[0].toUpperCase():'?'}</div>;
+}
+function Toast({msg,onDone}){
+  useEffect(()=>{const t=setTimeout(onDone,2500);return()=>clearTimeout(t);},[]);
+  return <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 bg-slate-700 text-white px-5 py-3 rounded-2xl text-sm font-medium shadow-xl fade-in border border-slate-600">{msg}</div>;
+}
+function Modal({title,onClose,children}){
+  return(
+    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{background:'rgba(0,0,0,0.7)'}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="w-full max-w-lg bg-slate-800 rounded-t-3xl border border-slate-700 slide-up" style={{maxHeight:'90vh',overflowY:'auto'}}>
+        <div className="flex items-center justify-between p-5 border-b border-slate-700">
+          <h2 className="text-lg font-bold">{title}</h2>
+          <button onClick={onClose} className="p-2 rounded-xl bg-slate-700">✕</button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+function Input({label,...props}){
+  return(
+    <div className="mb-4">
+      {label&&<label className="block text-sm font-medium text-slate-400 mb-1.5">{label}</label>}
+      <input {...props} className="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-green-500 text-sm"/>
+    </div>
+  );
+}
+
+// ── Navbar ──
+function Navbar({page,setPage}){
+  const tabs=[{id:'dashboard',label:'Groups',icon:'⊞'},{id:'activity',label:'Activity',icon:'📋'},{id:'stats',label:'Stats',icon:'📊'}];
+  return(
+    <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-slate-700 safe-bottom" style={{background:'rgba(15,23,42,0.95)',backdropFilter:'blur(20px)'}}>
+      <div className="flex max-w-lg mx-auto">
+        {tabs.map(t=>(
+          <button key={t.id} onClick={()=>setPage(t.id)} className={`flex-1 flex flex-col items-center gap-1 py-3 transition-colors ${page===t.id?'text-green-400':'text-slate-500'}`}>
+            <span className="text-xl">{t.icon}</span>
+            <span className="text-xs font-medium">{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Dashboard ──
+function Dashboard({setPage,setCurrentGroup}){
+  const[groups,setGroups]=useState([]);
+  const[expenses,setExpenses]=useState([]);
+  const[showCreate,setShowCreate]=useState(false);
+  const[newName,setNewName]=useState('');
+  const[newEmoji,setNewEmoji]=useState('👥');
+  const[newMembers,setNewMembers]=useState('');
+  const[toast,setToast]=useState('');
+
+  useEffect(()=>{loadData();},[]);
+  async function loadData(){
+    const g=await dbGetAll('groups');
+    const e=await dbGetAll('expenses');
+    setGroups(g);setExpenses(e);
+  }
+  async function createGroup(){
+    if(!newName.trim())return;
+    const members=newMembers.split(',').map(m=>m.trim()).filter(Boolean);
+    if(members.length<2){setToast('Add at least 2 members');return;}
+    const group={id:Date.now().toString(),name:newName.trim(),emoji:newEmoji,members,createdAt:Date.now()};
+    await dbPut('groups',group);
+    setGroups(prev=>[...prev,group]);
+    setNewName('');setNewMembers('');setNewEmoji('👥');setShowCreate(false);
+    setToast('Group created! 🎉');
+  }
+  const groupTotals={};
+  expenses.forEach(e=>{groupTotals[e.groupId]=(groupTotals[e.groupId]||0)+e.amount;});
+  const totalSpent=expenses.reduce((s,e)=>s+e.amount,0);
+  const emojis=['👥','🏖️','🏠','🍕','✈️','🎉','💼','🎮','🛍️','⚽'];
+
+  return(
+    <div className="min-h-screen bg-slate-900 pb-24">
+      <div className="px-5 pt-14 pb-6" style={{background:'linear-gradient(135deg,#0f172a 0%,#1e293b 100%)'}}>
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h1 className="text-2xl font-bold gradient-text">SplitEase</h1>
+            <p className="text-slate-400 text-sm mt-0.5">Personal expense splitter</p>
+          </div>
+          <button onClick={()=>setShowCreate(true)} className="w-12 h-12 bg-green-500 rounded-2xl flex items-center justify-center shadow-lg">
+            <span className="text-2xl font-light text-white">+</span>
+          </button>
+        </div>
+        <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4 flex gap-4">
+          <div className="flex-1 text-center border-r border-slate-700">
+            <div className="text-2xl font-bold text-green-400">₹{totalSpent.toLocaleString()}</div>
+            <div className="text-xs text-slate-400 mt-1">Total Spent</div>
+          </div>
+          <div className="flex-1 text-center border-r border-slate-700">
+            <div className="text-2xl font-bold text-blue-400">{groups.length}</div>
+            <div className="text-xs text-slate-400 mt-1">Groups</div>
+          </div>
+          <div className="flex-1 text-center">
+            <div className="text-2xl font-bold text-amber-400">{expenses.length}</div>
+            <div className="text-xs text-slate-400 mt-1">Expenses</div>
+          </div>
+        </div>
+      </div>
+      <div className="px-5 mt-4">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-bold text-slate-200">Your Groups</h2>
+          <span className="text-xs text-slate-500">{groups.length} groups</span>
+        </div>
+        {groups.length===0?(
+          <div className="text-center py-16">
+            <div className="text-6xl mb-4">🤝</div>
+            <div className="text-slate-300 font-semibold mb-2">No groups yet</div>
+            <div className="text-slate-500 text-sm mb-6">Create a group to start splitting expenses</div>
+            <button onClick={()=>setShowCreate(true)} className="bg-green-500 text-white px-6 py-3 rounded-2xl font-semibold">Create First Group</button>
+          </div>
+        ):(
+          groups.map(g=>(
+            <button key={g.id} onClick={()=>{setCurrentGroup(g.id);setPage('group');}}
+              className="w-full bg-slate-800 border border-slate-700 rounded-2xl p-4 flex items-center gap-4 card-hover text-left mb-3 slide-up">
+              <div className="w-12 h-12 rounded-2xl flex items-center justify-center text-2xl" style={{background:'rgba(34,197,94,0.15)'}}>{g.emoji||'👥'}</div>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-white truncate">{g.name}</div>
+                <div className="text-sm text-slate-400 mt-0.5">{g.members.length} members</div>
+              </div>
+              <div className="text-right">
+                <div className="text-sm font-bold text-green-400">₹{(groupTotals[g.id]||0).toLocaleString()}</div>
+                <div className="text-xs text-slate-500 mt-0.5">total</div>
+              </div>
+              <span className="text-slate-600">›</span>
+            </button>
+          ))
+        )}
+      </div>
+      {showCreate&&(
+        <Modal title="Create Group" onClose={()=>setShowCreate(false)}>
+          <div>
+            <label className="block text-sm font-medium text-slate-400 mb-2">Choose Emoji</label>
+            <div className="flex flex-wrap gap-2 mb-4">
+              {emojis.map(e=>(
+                <button key={e} onClick={()=>setNewEmoji(e)} className={`text-2xl p-2 rounded-xl transition ${newEmoji===e?'bg-green-500/20 border border-green-500':'bg-slate-700 border border-transparent'}`}>{e}</button>
+              ))}
+            </div>
+            <Input label="Group Name" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. Goa Trip, Flat, Office"/>
+            <Input label="Members (comma separated)" value={newMembers} onChange={e=>setNewMembers(e.target.value)} placeholder="e.g. Pratik, Amit, Rahul"/>
+            <div className="text-xs text-slate-500 mb-4 -mt-2">Add at least 2 members</div>
+            <button onClick={createGroup} className="w-full bg-green-500 text-white py-3.5 rounded-2xl font-bold text-sm">Create Group</button>
+          </div>
+        </Modal>
+      )}
+      {toast&&<Toast msg={toast} onDone={()=>setToast('')}/>}
+    </div>
+  );
+}
+
+// ── Group Page ──
+function GroupPage({groupId,setPage}){
+  const[group,setGroup]=useState(null);
+  const[expenses,setExpenses]=useState([]);
+  const[settlements,setSettlements]=useState([]);
+  const[tab,setTab]=useState('balances');
+  const[showAdd,setShowAdd]=useState(false);
+  const[toast,setToast]=useState('');
+  const[desc,setDesc]=useState('');
+  const[amount,setAmount]=useState('');
+  const[paidBy,setPaidBy]=useState('');
+  const[selMembers,setSelMembers]=useState([]);
+  const[expEmoji,setExpEmoji]=useState('💰');
+  const expEmojis=['💰','🍕','🚗','✈️','🏨','🎬','🛒','💊','🎮','🍺','☕','🎁'];
+
+  useEffect(()=>{loadAll();},[groupId]);
+  async function loadAll(){
+    const gs=await dbGetAll('groups');
+    const g=gs.find(x=>x.id===groupId);
+    if(g){setGroup(g);setSelMembers(g.members);setPaidBy(g.members[0]||'');}
+    const e=await dbGetByIndex('expenses','groupId',groupId);
+    const s=await dbGetByIndex('settlements','groupId',groupId);
+    setExpenses(e.sort((a,b)=>b.createdAt-a.createdAt));
+    setSettlements(s);
+  }
+  async function addExpense(){
+    if(!desc.trim()||!amount||!paidBy||!selMembers.length){setToast('Please fill all fields');return;}
+    const exp={id:Date.now().toString(),groupId,description:desc.trim(),amount:parseFloat(amount),paidBy,members:selMembers,emoji:expEmoji,createdAt:Date.now()};
+    await dbPut('expenses',exp);
+    setExpenses(prev=>[exp,...prev]);
+    setDesc('');setAmount('');setExpEmoji('💰');setSelMembers(group.members);setPaidBy(group.members[0]);
+    setShowAdd(false);setToast('Expense added! ✅');
+  }
+  async function deleteExpense(id){
+    await dbDelete('expenses',id);
+    setExpenses(prev=>prev.filter(e=>e.id!==id));
+    setToast('Expense deleted');
+  }
+  async function settle(debt){
+    const s={id:Date.now().toString(),groupId,from:debt.from,to:debt.to,amount:debt.amount,createdAt:Date.now()};
+    await dbPut('settlements',s);
+    setSettlements(prev=>[...prev,s]);
+    setToast(`${debt.from} paid ${debt.to} ₹${debt.amount} ✓`);
+  }
+  async function deleteGroup(){
+    if(!window.confirm('Delete this group and all expenses?'))return;
+    await dbDelete('groups',groupId);
+    const allExp=await dbGetByIndex('expenses','groupId',groupId);
+    for(const e of allExp)await dbDelete('expenses',e.id);
+    setPage('dashboard');
+  }
+  const toggleMember=m=>setSelMembers(prev=>prev.includes(m)?prev.filter(x=>x!==m):[...prev,m]);
+
+  if(!group)return <div className="flex items-center justify-center h-screen text-slate-500">Loading...</div>;
+
+  const{net,debts}=calculateBalances(group.members,expenses,settlements);
+  const totalSpent=expenses.reduce((s,e)=>s+e.amount,0);
+  const perPerson=group.members.length?totalSpent/group.members.length:0;
+
+  return(
+    <div className="min-h-screen bg-slate-900 pb-24">
+      <div className="px-5 pt-14 pb-5" style={{background:'linear-gradient(135deg,#0f172a,#1e293b)'}}>
+        <div className="flex items-center justify-between mb-4">
+          <button onClick={()=>setPage('dashboard')} className="p-2 rounded-xl bg-slate-700/50">‹ Back</button>
+          <button onClick={deleteGroup} className="p-2 rounded-xl bg-slate-700/50 text-red-400 text-sm">Delete</button>
+        </div>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="text-4xl">{group.emoji||'👥'}</div>
+          <div>
+            <h1 className="text-xl font-bold text-white">{group.name}</h1>
+            <p className="text-slate-400 text-sm">{group.members.length} members • {expenses.length} expenses</p>
+          </div>
+        </div>
+        <div className="flex gap-2 flex-wrap mb-4">
+          {group.members.map(m=>(
+            <div key={m} className="flex items-center gap-1.5 bg-slate-700/60 px-3 py-1.5 rounded-full">
+              <Avatar name={m} size={20}/>
+              <span className="text-sm font-medium text-slate-200">{m}</span>
+            </div>
+          ))}
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {[{label:'Total',value:`₹${totalSpent.toLocaleString()}`,color:'text-green-400'},{label:'Per Person',value:`₹${Math.round(perPerson).toLocaleString()}`,color:'text-blue-400'},{label:'Settled',value:`${settlements.length}`,color:'text-amber-400'}].map(s=>(
+            <div key={s.label} className="bg-slate-800/60 rounded-xl p-3 text-center">
+              <div className={`font-bold text-sm ${s.color}`}>{s.value}</div>
+              <div className="text-xs text-slate-500 mt-0.5">{s.label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex bg-slate-800/50 mx-5 rounded-2xl p-1 mt-4 mb-4">
+        {[['balances','Balances'],['expenses','Expenses'],['networth','Net Worth']].map(([id,label])=>(
+          <button key={id} onClick={()=>setTab(id)} className={`flex-1 py-2 rounded-xl text-sm font-semibold transition ${tab===id?'bg-slate-700 text-white shadow':'text-slate-500'}`}>{label}</button>
+        ))}
+      </div>
+
+      <div className="px-5">
+        {tab==='balances'&&(
+          <div>
+            {debts.length===0?(
+              <div className="text-center py-8 text-slate-500"><div className="text-4xl mb-2">🎉</div><div>All settled up!</div></div>
+            ):(
+              debts.map((d,i)=>(
+                <div key={i} className="bg-slate-800 border border-slate-700 rounded-2xl p-4 mb-3">
+                  <div className="flex items-center gap-3">
+                    <Avatar name={d.from} size={36}/>
+                    <div className="flex-1">
+                      <div className="text-sm font-semibold"><span className="text-red-400">{d.from}</span> owes <span className="text-green-400">{d.to}</span></div>
+                      <div className="text-lg font-bold text-white mt-0.5">₹{d.amount.toLocaleString()}</div>
+                    </div>
+                    <button onClick={()=>settle(d)} className="flex items-center gap-1 bg-green-500/10 border border-green-500/30 text-green-400 text-xs font-semibold px-3 py-2 rounded-xl">✓ Settle</button>
+                  </div>
+                </div>
+              ))
+            )}
+            {settlements.length>0&&(
+              <div className="mt-4">
+                <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-2">Settlement History</div>
+                {settlements.map(s=>(
+                  <div key={s.id} className="bg-slate-800 border border-slate-700 rounded-xl p-3 mb-2 flex items-center justify-between">
+                    <div className="text-sm text-slate-300"><span className="text-red-400 font-medium">{s.from}</span> → <span className="text-green-400 font-medium">{s.to}</span></div>
+                    <div className="font-bold text-white text-sm">₹{s.amount}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {tab==='expenses'&&(
+          <div>
+            {expenses.length===0?(
+              <div className="text-center py-12 text-slate-500"><div className="text-5xl mb-3">📋</div><div>No expenses yet</div></div>
+            ):(
+              expenses.map(e=>(
+                <div key={e.id} className="bg-slate-800 border border-slate-700 rounded-2xl p-4 mb-3 fade-in">
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl flex items-center justify-center text-lg" style={{background:'rgba(59,130,246,0.15)'}}>{e.emoji||'💰'}</div>
+                      <div>
+                        <div className="font-semibold text-white text-sm">{e.description}</div>
+                        <div className="text-xs text-slate-400 mt-0.5">Paid by <span className="text-green-400 font-medium">{e.paidBy}</span></div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-right">
+                        <div className="font-bold text-white">₹{e.amount.toLocaleString()}</div>
+                        <div className="text-xs text-slate-500">{e.members.length} people</div>
+                      </div>
+                      <button onClick={()=>deleteExpense(e.id)} className="p-2 rounded-xl text-slate-600 hover:text-red-400">🗑</button>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {e.members.map(m=><span key={m} className="text-xs bg-slate-700 text-slate-300 px-2.5 py-1 rounded-full">{m}</span>)}
+                  </div>
+                  <div className="mt-2 text-xs text-slate-600">{new Date(e.createdAt).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}</div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+        {tab==='networth'&&(
+          <div>
+            <div className="text-xs text-slate-500 font-semibold uppercase tracking-wider mb-3">Net Balance Per Person</div>
+            {group.members.map(m=>{
+              const bal=net[m]||0;
+              return(
+                <div key={m} className="bg-slate-800 border border-slate-700 rounded-2xl p-4 mb-3 flex items-center gap-3">
+                  <Avatar name={m} size={40}/>
+                  <div className="flex-1">
+                    <div className="font-semibold text-white">{m}</div>
+                    <div className="text-xs text-slate-500 mt-0.5">{bal>0?'Gets back':bal<0?'Owes':'Settled'}</div>
+                  </div>
+                  <div className={`text-lg font-bold ${bal>0?'text-green-400':bal<0?'text-red-400':'text-slate-500'}`}>
+                    {bal>0?'+':''}₹{Math.round(Math.abs(bal)).toLocaleString()}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <button onClick={()=>setShowAdd(true)} className="fixed bottom-24 right-5 w-14 h-14 bg-green-500 rounded-2xl flex items-center justify-center shadow-xl z-30">
+        <span className="text-2xl text-white">+</span>
+      </button>
+
+      {showAdd&&(
+        <Modal title="Add Expense" onClose={()=>setShowAdd(false)}>
+          <div>
+            <label className="block text-sm font-medium text-slate-400 mb-2">Category</label>
+            <div className="flex flex-wrap gap-2 mb-4">
+              {expEmojis.map(e=>(
+                <button key={e} onClick={()=>setExpEmoji(e)} className={`text-xl p-2 rounded-xl transition ${expEmoji===e?'bg-green-500/20 border border-green-500':'bg-slate-700 border border-transparent'}`}>{e}</button>
+              ))}
+            </div>
+            <Input label="Description" value={desc} onChange={e=>setDesc(e.target.value)} placeholder="e.g. Dinner, Hotel, Fuel"/>
+            <Input label="Amount (₹)" type="number" value={amount} onChange={e=>setAmount(e.target.value)} placeholder="0"/>
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-slate-400 mb-1.5">Paid By</label>
+              <select value={paidBy} onChange={e=>setPaidBy(e.target.value)} className="w-full bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-green-500 text-sm">
+                {group.members.map(m=><option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+            <div className="mb-5">
+              <label className="block text-sm font-medium text-slate-400 mb-2">Split Between</label>
+              <div className="flex flex-wrap gap-2">
+                {group.members.map(m=>(
+                  <button key={m} onClick={()=>toggleMember(m)} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium transition border ${selMembers.includes(m)?'bg-green-500/15 border-green-500/50 text-green-400':'bg-slate-700 border-slate-600 text-slate-400'}`}>
+                    <Avatar name={m} size={18}/>{m}{selMembers.includes(m)&&' ✓'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {amount&&selMembers.length>0&&(
+              <div className="bg-slate-700/50 rounded-xl p-3 mb-4 text-center">
+                <span className="text-slate-400 text-sm">Each pays </span>
+                <span className="text-green-400 font-bold">₹{(parseFloat(amount||0)/selMembers.length).toFixed(2)}</span>
+              </div>
+            )}
+            <button onClick={addExpense} className="w-full bg-green-500 text-white py-3.5 rounded-2xl font-bold text-sm">Add Expense</button>
+          </div>
+        </Modal>
+      )}
+      {toast&&<Toast msg={toast} onDone={()=>setToast('')}/>}
+    </div>
+  );
+}
+
+// ── Activity ──
+function ActivityPage(){
+  const[expenses,setExpenses]=useState([]);
+  const[groups,setGroups]=useState([]);
+  useEffect(()=>{
+    async function load(){
+      const e=await dbGetAll('expenses');
+      const g=await dbGetAll('groups');
+      setExpenses(e.sort((a,b)=>b.createdAt-a.createdAt));
+      setGroups(g);
+    }
+    load();
+  },[]);
+  const groupMap={};
+  groups.forEach(g=>groupMap[g.id]=g);
+  return(
+    <div className="min-h-screen bg-slate-900 pb-24">
+      <div className="px-5 pt-14 pb-5" style={{background:'linear-gradient(135deg,#0f172a,#1e293b)'}}>
+        <h1 className="text-2xl font-bold text-white">Activity</h1>
+        <p className="text-slate-400 text-sm mt-1">All expenses across groups</p>
+      </div>
+      <div className="px-5 mt-4">
+        {expenses.length===0?(
+          <div className="text-center py-16 text-slate-500"><div className="text-5xl mb-3">📭</div><div>No activity yet</div></div>
+        ):(
+          expenses.map(e=>(
+            <div key={e.id} className="bg-slate-800 border border-slate-700 rounded-2xl p-4 mb-3 fade-in">
+              <div className="flex items-center gap-3">
+                <div className="text-2xl">{e.emoji||'💰'}</div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold text-white text-sm truncate">{e.description}</div>
+                  <div className="text-xs text-slate-400 mt-0.5">{groupMap[e.groupId]?.name||'Unknown'} • {e.paidBy}</div>
+                </div>
+                <div className="text-right">
+                  <div className="font-bold text-green-400">₹{e.amount.toLocaleString()}</div>
+                  <div className="text-xs text-slate-500">{new Date(e.createdAt).toLocaleDateString('en-IN',{day:'numeric',month:'short'})}</div>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Stats ──
+function StatsPage(){
+  const[expenses,setExpenses]=useState([]);
+  const[groups,setGroups]=useState([]);
+  const chartRef=useRef(null);
+  const chartInstance=useRef(null);
+  useEffect(()=>{
+    async function load(){
+      const e=await dbGetAll('expenses');
+      const g=await dbGetAll('groups');
+      setExpenses(e);setGroups(g);
+    }
+    load();
+  },[]);
+  useEffect(()=>{
+    if(!chartRef.current||!expenses.length)return;
+    if(chartInstance.current)chartInstance.current.destroy();
+    const monthly={};
+    expenses.forEach(e=>{
+      const key=new Date(e.createdAt).toLocaleDateString('en-IN',{month:'short',year:'2-digit'});
+      monthly[key]=(monthly[key]||0)+e.amount;
+    });
+    chartInstance.current=new Chart(chartRef.current,{
+      type:'bar',
+      data:{labels:Object.keys(monthly),datasets:[{label:'Spending (₹)',data:Object.values(monthly),backgroundColor:'rgba(34,197,94,0.4)',borderColor:'#22c55e',borderWidth:2,borderRadius:8}]},
+      options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'#94a3b8'}},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'#94a3b8',callback:v=>'₹'+v.toLocaleString()}}}}
+    });
+  },[expenses]);
+  const totalSpent=expenses.reduce((s,e)=>s+e.amount,0);
+  const avgExpense=expenses.length?totalSpent/expenses.length:0;
+  const payerTotals={};
+  expenses.forEach(e=>{payerTotals[e.paidBy]=(payerTotals[e.paidBy]||0)+e.amount;});
+  const topPayers=Object.entries(payerTotals).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  return(
+    <div className="min-h-screen bg-slate-900 pb-24">
+      <div className="px-5 pt-14 pb-5" style={{background:'linear-gradient(135deg,#0f172a,#1e293b)'}}>
+        <h1 className="text-2xl font-bold text-white">Statistics</h1>
+        <p className="text-slate-400 text-sm mt-1">Spending overview</p>
+      </div>
+      <div className="px-5 mt-4">
+        <div className="grid grid-cols-2 gap-3 mb-5">
+          {[{label:'Total Spent',value:`₹${totalSpent.toLocaleString()}`,color:'text-green-400',icon:'💰'},{label:'Avg Expense',value:`₹${Math.round(avgExpense).toLocaleString()}`,color:'text-blue-400',icon:'📊'},{label:'Groups',value:groups.length,color:'text-purple-400',icon:'👥'},{label:'Expenses',value:expenses.length,color:'text-amber-400',icon:'📋'}].map(s=>(
+            <div key={s.label} className="bg-slate-800 border border-slate-700 rounded-2xl p-4">
+              <div className="text-2xl mb-1">{s.icon}</div>
+              <div className={`text-xl font-bold ${s.color}`}>{s.value}</div>
+              <div className="text-xs text-slate-500 mt-0.5">{s.label}</div>
+            </div>
+          ))}
+        </div>
+        {expenses.length>0&&(
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4 mb-5">
+            <div className="text-sm font-semibold text-slate-300 mb-3">Monthly Spending</div>
+            <canvas ref={chartRef} height="200"/>
+          </div>
+        )}
+        {topPayers.length>0&&(
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4">
+            <div className="text-sm font-semibold text-slate-300 mb-3">Top Payers</div>
+            {topPayers.map(([name,amt],i)=>(
+              <div key={name} className="flex items-center gap-3 mb-3">
+                <div className="text-slate-500 text-sm font-bold w-5">{i+1}</div>
+                <Avatar name={name} size={32}/>
+                <div className="flex-1">
+                  <div className="text-sm font-medium text-white">{name}</div>
+                  <div className="h-1.5 bg-slate-700 rounded-full mt-1.5 overflow-hidden">
+                    <div className="h-full bg-green-500 rounded-full" style={{width:`${(amt/topPayers[0][1])*100}%`}}/>
+                  </div>
+                </div>
+                <div className="text-sm font-bold text-green-400">₹{amt.toLocaleString()}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {expenses.length===0&&(
+          <div className="text-center py-16 text-slate-500"><div className="text-5xl mb-3">📊</div><div>No data yet</div><div className="text-sm mt-1">Add expenses to see stats</div></div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──
+function App(){
+  const[page,setPage]=useState('dashboard');
+  const[currentGroup,setCurrentGroup]=useState(null);
+
+  useEffect(()=>{
+    // PWA Manifest
+    const manifest={name:'SplitEase',short_name:'SplitEase',description:'Personal expense splitting app',start_url:'.',display:'standalone',background_color:'#0f172a',theme_color:'#0f172a',orientation:'portrait',icons:[{src:"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%230f172a'/><text y='.9em' font-size='80' x='10'>💸</text></svg>",sizes:'512x512',type:'image/svg+xml'}]};
+    const blob=new Blob([JSON.stringify(manifest)],{type:'application/json'});
+    document.getElementById('manifest-placeholder').href=URL.createObjectURL(blob);
+    // Service Worker
+    if('serviceWorker' in navigator){
+      const sw=`const CACHE='splitease-v1';self.addEventListener('install',e=>{self.skipWaiting();});self.addEventListener('activate',e=>{self.clients.claim();});self.addEventListener('fetch',e=>{e.respondWith(fetch(e.request).catch(()=>caches.match(e.request)));});`;
+      const swBlob=new Blob([sw],{type:'application/javascript'});
+      navigator.serviceWorker.register(URL.createObjectURL(swBlob)).catch(()=>{});
+    }
+  },[]);
+
+  if(page==='group'&&currentGroup)return <GroupPage groupId={currentGroup} setPage={setPage}/>;
+  return(
+    <div>
+      {page==='dashboard'&&<Dashboard setPage={setPage} setCurrentGroup={setCurrentGroup}/>}
+      {page==='activity'&&<ActivityPage/>}
+      {page==='stats'&&<StatsPage/>}
+      <Navbar page={page} setPage={setPage}/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
